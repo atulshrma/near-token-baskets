@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { connect, WalletConnection, utils, Contract } from 'near-api-js';
 import { getConfig } from './config';
 
@@ -6,11 +6,52 @@ const {
   format: { formatNearAmount },
 } = utils;
 
+const indexDetails = {
+  tokenIn: {
+    id: "ref.fakes.testnet",
+    decimals: 18,
+  },
+  tokenList: [
+    {
+      id:"hapi.fakes.testnet",
+      decimals: 18,
+      alloc: 260870876845,
+      poolId: 114,
+    },
+    {
+      id:"wrap.testnet",
+      decimals: 24,
+      alloc: 219284133101099070687201,
+      poolId: 17,
+    },
+    // {
+    //   id:"usdc.fakes.testnet",
+    //   decimals: 6,
+    //   alloc: 1761736,
+    //   poolId: 374,
+    // },
+    // {
+    //   id:"usdt.fakes.testnet",
+    //   decimals: 6,
+    //   alloc: 1577395,
+    //   poolId: 31,
+    // },
+    {
+      id:"paras.fakes.testnet",
+      decimals: 18,
+      alloc: 898559731120276687,
+      poolId: 299,
+    },
+  ]
+}
+
 const App = () => {
   const [wallet, setWallet] = useState(null);
   const [contract, setContract] = useState(null);
-  const [counter, setCounter] = useState(0);
-  const [deposit, setDeposit] = useState(0);
+  const [indexTokens, setIndexTokens] = useState([]);
+  const [amtIn, setAmtIn] = useState(0);
+  const [minIn, setMinIn] = useState(0);
+  const [tokenDist, setTokenDist] = useState(null);
   const [balance, setBalance] = useState('');
 
   // Establish a connection to the NEAR blockchain on component mount
@@ -22,13 +63,13 @@ const App = () => {
   useEffect(() => {
     if (wallet) {
       setContract(
-        new Contract(wallet.account(), 'counter.testnet', {
-          viewMethods: ['getCounter'],
-          changeMethods: [
-            'resetCounter',
-            'incrementCounter',
-            'decrementCounter',
+        new Contract(wallet.account(), 'ref-finance-101.testnet', {
+          viewMethods: [
+            'get_pools',
+            'get_pool_total_shares',
+            'get_deposits',
           ],
+          changeMethods: [],
         })
       );
 
@@ -49,56 +90,106 @@ const App = () => {
   // The call happens asynchronously and the result is returned in a Promise
   useEffect(() => {
     if (isSignedIn) {
-      contract.getCounter().then((counter) => {
-        setCounter(counter);
+      // contract
+      //   .get_deposits({ account_id: "dev-1661065232448-46728115400748" })
+      //   .then((deposits) => {
+      //     // setCounter(counter);
+      //     console.log(deposits);
+      //   });
+      const compDetails = [];
+      for (const tokenOut of indexDetails.tokenList) {
+        compDetails.push(
+          contract
+            .get_pools({
+            from_index: tokenOut.poolId,
+            limit: 1,
+          })
+        );
+      }
+      Promise.all(compDetails).then(pools => {
+        setIndexTokens(pools);
       });
     }
   }, [contract, isSignedIn]);
 
+  useEffect(() => {
+    if (indexTokens.length > 0) {
+      const tokenDistLocal = [];
+      for (let token of indexTokens) {
+        token = token[0];
+        const id = token.token_account_ids.indexOf(indexDetails.tokenIn.id);
+        const tokenIn = token.token_account_ids[id];
+        const tokenInLiquidity = token.amounts[id];
+        const tokenOut = token.token_account_ids[token.token_account_ids.length-1-id];
+        const tokenOutLiquidity = token.amounts[token.amounts.length-1-id];
+        const tokenOutDetails = indexDetails.tokenList.find(token => token.id == tokenOut);
+        
+        const outWithOneIn = tokenOutLiquidity/tokenInLiquidity;
+        const inForMinOut = (tokenOutDetails.alloc * 10 ** (-1*tokenOutDetails.decimals)) / outWithOneIn;
+        const poolFee = token.total_fee / 1000;
+        tokenDistLocal.push({
+          tokenIn,
+          tokenOut,
+          outWithOneIn,
+          inForMinOut,
+          poolFee,
+        });
+      }
+      console.log(tokenDistLocal);
+      setTokenDist(tokenDistLocal);
+      let min = 0;
+      for (const dist of tokenDistLocal) {
+        min += dist.inForMinOut;
+        // console.log(dist.tokenOut,dist.inForMinOut);
+      }
+      setMinIn(min);
+    }
+  }, [indexTokens]);
+
   // Handle the sign in call by requesting a sign in through the NEAR Wallet
   const handleLogin = () => {
     wallet.requestSignIn({
-      contractId: 'counter.testnet',
+      contractId: 'ref-finance-101.testnet',
       methodNames: [
-        'resetCounter',
-        'incrementCounter',
-        'decrementCounter',
-        'getCounter',
+        'get_pools',
+        'get_pool_total_shares',
+        'get_deposits',
       ],
     });
   };
 
-  const handleReset = async () => {
-    // Call the reset function on the counter contract
-    // We have to deposit at least one yoctoNEAR (1e-24 NEAR) to be able to call change functions
-    await contract.resetCounter({
-      args: {},
-      amount: deposit.toFixed(0),
-    });
+  useEffect(() => {
+    if (tokenDist) {
 
-    // When calling view functions, we don't need to deposit
-    setCounter(await contract.getCounter());
-  };
-
-  const handleIncrement = async () => {
-    // Call the increment function on the counter contract
-    await contract.incrementCounter({
-      args: { value: 1 },
-      amount: deposit.toFixed(0),
-    });
-
-    setCounter(await contract.getCounter());
-  };
-
-  const handleDecrement = async () => {
-    // Call the decrement function on the counter contract
-    await contract.decrementCounter({
-      args: { value: 1 },
-      amount: deposit.toFixed(0),
-    });
-
-    setCounter(await contract.getCounter());
-  };
+      const platformFee = 0.2/100 * amtIn;
+      const distributorFee = 0.2/100 * amtIn;
+      let swapFee = 0;
+      const actualIn = amtIn - platformFee - distributorFee;
+      const split = [];
+      for(const dist of tokenDist) {
+        const amtInDist = dist.inForMinOut * actualIn / minIn;
+        const poolFee = dist.poolFee * amtInDist;
+        swapFee += poolFee;
+        const minOut = dist.outWithOneIn * (amtInDist - poolFee)
+        split.push({
+          tokenIn: dist.tokenIn,
+          tokenOut: dist.tokenOut,
+          poolFee,
+          minOut,
+          amtInDist,
+        })
+      }
+      console.log(
+        {
+          amtIn,
+          distributorFee,
+          platformFee,
+          swapFee,
+          split,
+        }
+      )
+    }
+  }, [amtIn]);
 
   return (
     <section>
@@ -114,24 +205,23 @@ const App = () => {
             <strong>{formatNearAmount(balance, 4)}</strong>
           </p>
           <p>
-            The current value of the counter is: <strong>{counter}</strong>
+            Min invest amount is {' '}
+            {/* The balance will be retrieved in yoctoNEAR so we have to format it to a NEAR amount */}
+            <strong>{minIn.toString()}</strong>
           </p>
-          <label htmlFor="deposit">
-            <span>Deposit value (in yoctoNEAR): </span>
+          <label htmlFor="amtIn">
+            <span>Amt In: </span>
             <input
-              id="deposit"
+              id="amtIn"
               type="number"
-              min={1}
-              value={deposit}
-              onChange={({ target: { value } }) => setDeposit(parseInt(value))}
+              min={0}
+              value={amtIn}
+              onChange={({ target: { value } }) => setAmtIn(parseInt(value))}
             />
           </label>
           <div
             style={{ display: 'flex', flexDirection: 'column', width: '50%' }}
           >
-            <button onClick={() => handleReset()}>Reset Counter</button>
-            <button onClick={() => handleIncrement()}>Increment counter</button>
-            <button onClick={() => handleDecrement()}>Decrement counter</button>
           </div>
         </div>
       ) : (
